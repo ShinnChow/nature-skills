@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import importlib.util
 import unittest
 from pathlib import Path
@@ -98,6 +99,44 @@ class StarHistoryFetchingTests(unittest.TestCase):
         self.assertEqual(total, 40_001)
         self.assertEqual(len(items), 40_001)
 
+    def test_transient_graphql_error_is_retried(self) -> None:
+        error = json.dumps({"errors": [{"message": "Something went wrong while executing your query"}]})
+        ok = json.dumps(graphql_page(1, ["2026-01-01T00:00:00Z"], has_next=False, end_cursor=None))
+        replies = [error, ok]
+
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return self.body.encode()
+
+        with mock.patch.object(MODULE.urllib.request, "urlopen", side_effect=lambda *a, **k: Response(replies.pop(0))), mock.patch.object(MODULE.time, "sleep"):
+            payload = MODULE.github_graphql(MODULE.STARGAZERS_QUERY, {}, "token", 2)
+
+        self.assertEqual(payload["data"]["repository"]["stargazerCount"], 1)
+
+    def test_persistent_transient_error_shrinks_page_size(self) -> None:
+        sizes = []
+
+        def respond(query, variables, token, retries):
+            sizes.append(variables["first"])
+            if variables["first"] > 25:
+                raise MODULE.TransientGraphQLError("boom")
+            return graphql_page(1, ["2026-01-01T00:00:00Z"], has_next=False, end_cursor=None)
+
+        with mock.patch.object(MODULE, "github_graphql", side_effect=respond):
+            total, _ = MODULE.fetch_stargazers("owner/repo", "token", 1, 0)
+
+        self.assertEqual(sizes, [100, 50, 25])
+        self.assertEqual(total, 1)
+
     def test_missing_token_fails_with_actionable_message(self) -> None:
         with self.assertRaisesRegex(MODULE.StarHistoryUnavailable, "requires GITHUB_TOKEN"):
             MODULE.github_graphql(MODULE.STARGAZERS_QUERY, {}, None, 0)
@@ -119,6 +158,44 @@ class StarHistoryFetchingTests(unittest.TestCase):
 
         self.assertIn("after: $cursor", source)
         self.assertNotIn("/stargazers?per_page=100&page=", source)
+
+
+class StarHistoryIncrementalTests(unittest.TestCase):
+    def test_merge_replaces_days_from_since_onward(self) -> None:
+        daily = {dt.date(2026, 1, 1): 5, dt.date(2026, 1, 2): 3}
+        merged = MODULE.merge_recent_into_daily(
+            daily,
+            [dt.date(2026, 1, 2)] * 4 + [dt.date(2026, 1, 3)],
+            dt.date(2026, 1, 2),
+        )
+        self.assertEqual(merged, {dt.date(2026, 1, 1): 5, dt.date(2026, 1, 2): 4, dt.date(2026, 1, 3): 1})
+
+    def test_recent_fetch_stops_once_cache_range_is_reached(self) -> None:
+        pages = [
+            graphql_page(10, ["2026-01-05T00:00:00Z"] * 100, has_next=True, end_cursor="c1"),
+            graphql_page(10, ["2026-01-04T00:00:00Z", "2026-01-02T00:00:00Z"], has_next=True, end_cursor="c2"),
+        ]
+        with mock.patch.object(MODULE, "github_graphql", side_effect=pages) as request:
+            total, recent = MODULE.fetch_recent_star_dates("o/r", "t", 0, dt.date(2026, 1, 3))
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(total, 10)
+        self.assertEqual(len(recent), 101)
+        self.assertEqual(request.call_args_list[0].args[1]["direction"], "DESC")
+
+    def test_large_drift_triggers_full_fetch(self) -> None:
+        daily = {dt.date(2026, 1, 1): 500}
+        with mock.patch.object(MODULE, "fetch_recent_star_dates", return_value=(1000, [])):
+            self.assertIsNone(MODULE.update_daily_incrementally("o/r", "t", 0, daily))
+
+    def test_cache_round_trip_and_repo_mismatch(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "data.json"
+            MODULE.save_daily_cache(path, "o/r", {dt.date(2026, 1, 1): 2})
+            self.assertEqual(MODULE.load_daily_cache(path, "o/r"), {dt.date(2026, 1, 1): 2})
+            self.assertIsNone(MODULE.load_daily_cache(path, "other/repo"))
+            self.assertIsNone(MODULE.load_daily_cache(Path(directory) / "missing.json", "o/r"))
 
 
 class StarHistoryRenderingTests(unittest.TestCase):
